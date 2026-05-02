@@ -80,7 +80,7 @@ BLACK = (0, 0, 0)
 class PoolEnvironment:
     """Pool game environment for reinforcement learning."""
     
-    def __init__(self, render_mode=None, ball_count: int = 15, random_balls: bool = False):
+    def __init__(self, render_mode=None, ball_count: int = 15, random_balls: bool = False, layout: str = "rack"):
         """Initialize the pool environment.
         
         Args:
@@ -106,7 +106,10 @@ class PoolEnvironment:
         self.cue_ball = None
         self.balls = []
         self.ball_count = self._clamp_ball_count(ball_count)
+        self.max_shots = max(30, self.ball_count * 12)
+        self.shots_taken = 0
         self.random_balls = bool(random_balls)
+        self.layout = self._normalize_layout(layout)
         self.players = [
             {"name": "Player 1", "type": None, "score": 0, "color": (200, 30, 30)},
             {"name": "Player 2", "type": None, "score": 0, "color": (30, 150, 30)}
@@ -118,6 +121,7 @@ class PoolEnvironment:
         self.ball_assignment_done = False
         self.first_ball_hit = None
         self.winner = None
+        self.shots_taken = 0
         
         # Rendering setup
         self.render_mode = render_mode
@@ -128,13 +132,43 @@ class PoolEnvironment:
         self.reset()
     
     def _clamp_ball_count(self, count: int) -> int:
-        return max(1, min(15, int(count)))
+        return max(2, min(15, int(count)))
 
     def set_ball_count(self, count: int):
         self.ball_count = self._clamp_ball_count(count)
+        self.max_shots = max(30, self.ball_count * 12)
 
     def set_random_balls(self, enabled: bool):
         self.random_balls = bool(enabled)
+
+    def set_layout(self, layout: str):
+        self.layout = self._normalize_layout(layout)
+
+    def _normalize_layout(self, layout: str) -> str:
+        layout = str(layout or "rack").lower()
+        if layout in ("beginner", "easy"):
+            return "beginner"
+        return "rack"
+
+    def _ball_colors(self):
+        brown = (150, 75, 0)
+        return [
+            YELLOW,     # 1
+            BLUE,       # 2
+            RED,        # 3
+            PURPLE,     # 4
+            ORANGE,     # 5
+            GREEN,      # 6
+            brown,      # 7
+            BLACK,      # 8
+            YELLOW,     # 9  (striped)
+            BLUE,       # 10 (striped)
+            RED,        # 11 (striped)
+            PURPLE,     # 12 (striped)
+            ORANGE,     # 13 (striped)
+            GREEN,      # 14 (striped)
+            brown       # 15 (striped)
+        ]
 
     def _random_position(self, existing):
         # Keep ball away from cushions/pockets and other balls
@@ -165,28 +199,31 @@ class PoolEnvironment:
             ball.original_pos = (ball.x, ball.y)
             placed.append(ball)
 
+    def _jitter_beginner_positions(self, balls: list):
+        self.cue_ball.x = 280 + random.uniform(-35, 35)
+        self.cue_ball.y = 213 + random.uniform(-35, 35)
+        self.cue_ball.original_pos = (self.cue_ball.x, self.cue_ball.y)
+
+        placed = [self.cue_ball]
+        for ball in balls:
+            original_x, original_y = ball.x, ball.y
+            for _ in range(40):
+                x = max(120, min(self.width - 120, original_x + random.uniform(-35, 35)))
+                y = max(120, min(self.height - 120, original_y + random.uniform(-35, 35)))
+                if all(math.hypot(x - other.x, y - other.y) >= self.ball_radius + other.radius + 8 for other in placed):
+                    ball.x, ball.y = x, y
+                    break
+            ball.original_pos = (ball.x, ball.y)
+            placed.append(ball)
+
     def setup_balls(self):
         """Set up the initial position of balls in triangle formation."""
+        if self.layout == "beginner":
+            return self._setup_beginner_balls()
+
         balls = []
         
-        # Ball colors (same as original game)
-        ball_colors = [
-            YELLOW,     # 1
-            BLUE,       # 2
-            RED,        # 3
-            PURPLE,     # 4
-            ORANGE,     # 5
-            GREEN,      # 6
-            BROWN := (150, 75, 0),      # 7
-            BLACK,      # 8
-            YELLOW,     # 9  (striped)
-            BLUE,       # 10 (striped)
-            RED,        # 11 (striped)
-            PURPLE,     # 12 (striped)
-            ORANGE,     # 13 (striped)
-            GREEN,      # 14 (striped)
-            BROWN       # 15 (striped)
-        ]
+        ball_colors = self._ball_colors()
         
         # Triangle rack formation
         rack_start_x = self.width * 3 // 4
@@ -201,18 +238,8 @@ class PoolEnvironment:
             (4, -2), (4, -1), (4, 0), (4, 1), (4, 2)   # 5th row
         ]
         
-        # Fill positions with balls
-        ball_numbers = list(range(1, 16))
-        random.shuffle(ball_numbers)
-        
-        # Make sure the 8 ball is in the middle of the 3rd row
-        eight_ball_pos = ball_positions[4]  # Middle of 3rd row
-        eight_idx = ball_numbers.index(8)
-        other_idx = 4
-        ball_numbers[eight_idx], ball_numbers[other_idx] = ball_numbers[other_idx], ball_numbers[eight_idx]
-        
         selected_positions = ball_positions[:self.ball_count]
-        selected_numbers = ball_numbers[:self.ball_count]
+        selected_numbers = self._select_training_ball_numbers()
 
         for i, (offset_x, offset_y) in enumerate(selected_positions):
             number = selected_numbers[i]
@@ -223,6 +250,55 @@ class PoolEnvironment:
             balls.append(Ball(x, y, ball_colors[number-1], ball_number, self.ball_radius, is_striped))
         
         return balls
+
+    def _setup_beginner_balls(self):
+        """Set up balls in open, pottable positions for early training."""
+        self.cue_ball.x = 280
+        self.cue_ball.y = 213
+        self.cue_ball.original_pos = (self.cue_ball.x, self.cue_ball.y)
+
+        ball_colors = self._ball_colors()
+        object_numbers = [n for n in range(1, 16) if n != 8]
+        selected_numbers = object_numbers[:self.ball_count - 1] + [8]
+
+        easy_positions = [
+            (160, 133),                         # top-left pocket
+            (self.width - 160, self.height - 133),  # bottom-right pocket
+            (self.width - 160, 133),             # top-right pocket
+            (160, self.height - 133),            # bottom-left pocket
+            (self.width * 0.50, 130),            # top-middle pocket
+            (self.width * 0.50, self.height - 130),  # bottom-middle pocket
+            (self.width * 0.82, self.height * 0.50),
+            (self.width * 0.18, self.height * 0.50),
+            (self.width * 0.70, self.height * 0.34),
+            (self.width * 0.30, self.height * 0.66),
+            (self.width * 0.60, self.height * 0.24),
+            (self.width * 0.40, self.height * 0.76),
+            (self.width * 0.75, self.height * 0.76),
+            (self.width * 0.25, self.height * 0.24),
+            (self.width * 0.50, self.height * 0.50),
+        ]
+
+        balls = []
+        for number, (x, y) in zip(selected_numbers, easy_positions):
+            is_striped = number > 8
+            balls.append(Ball(x, y, ball_colors[number - 1], number, self.ball_radius, is_striped))
+
+        return balls
+
+    def _select_training_ball_numbers(self):
+        """Choose a reduced 8-ball set that always contains the 8 ball."""
+        object_numbers = [n for n in range(1, 16) if n != 8]
+        random.shuffle(object_numbers)
+
+        if self.ball_count >= 5:
+            selected = object_numbers[:self.ball_count - 1]
+            selected.insert(4, 8)
+            return selected
+
+        selected = object_numbers[:self.ball_count - 1]
+        selected.append(8)
+        return selected
     
     def reset(self):
         """Reset the environment to initial state."""
@@ -232,7 +308,9 @@ class PoolEnvironment:
         # Create all other balls
         self.balls = self.setup_balls()
 
-        if self.random_balls:
+        if self.random_balls and self.layout == "beginner":
+            self._jitter_beginner_positions(self.balls)
+        elif self.random_balls:
             self._randomize_ball_positions(self.balls)
             pos = self._random_position(self.balls)
             if pos:
@@ -251,6 +329,7 @@ class PoolEnvironment:
         self.ball_assignment_done = False
         self.first_ball_hit = None
         self.winner = None
+        self.shots_taken = 0
         
         # Return initial observation
         return self._get_observation()
@@ -515,6 +594,7 @@ class PoolEnvironment:
         """
         # Extract action parameters
         acting_player = self.current_player
+        assignment_done_before_shot = self.ball_assignment_done
         angle = action.get('angle', 0)
         power = action.get('power', 0)
         
@@ -522,6 +602,7 @@ class PoolEnvironment:
         done = False
         info = {}
         shot_potted_balls = []
+        self.shots_taken += 1
         best_target_dist_before = self._best_target_distance_to_hole(acting_player)
         reward -= 0.05  # Small shot cost encourages finishing in fewer turns
         
@@ -592,7 +673,14 @@ class PoolEnvironment:
                 break
         
         # After simulation, check if a valid shot was made
-        if not self.foul and not self.valid_shot():
+        if self.first_ball_hit is None and shot_potted_balls:
+            self.first_ball_hit = shot_potted_balls[0]
+
+        shot_valid = self.valid_shot()
+        if not assignment_done_before_shot and self.first_ball_hit is not None:
+            shot_valid = True
+
+        if not self.foul and not shot_valid:
             self.foul = True
             reward -= 2  # Penalty for invalid shot
 
@@ -614,6 +702,19 @@ class PoolEnvironment:
                 else:
                     reward -= 1.0
 
+        if self.layout == "beginner":
+            object_ball_potted = any(ball.number != 8 for ball in shot_potted_balls)
+            all_object_balls_potted = all(
+                ball.potted for ball in self.balls if ball.number != 8
+            )
+            if (
+                (self.ball_count <= 3 and object_ball_potted)
+                or (self.ball_count > 3 and all_object_balls_potted)
+            ):
+                self.winner = acting_player
+                done = True
+                info["beginner_drill_complete"] = True
+
         # Reward making target balls closer to pockets; penalty for moving away
         best_target_dist_after = self._best_target_distance_to_hole(acting_player)
         if best_target_dist_before is not None and best_target_dist_after is not None:
@@ -628,13 +729,22 @@ class PoolEnvironment:
             self.winner = acting_player
             done = True
 
+        if self.winner is None and self.shots_taken >= self.max_shots:
+            self.winner = 1
+            done = True
+            info["timeout"] = True
+            reward -= 8
+
         # Check for game over
         if self.winner is not None:
             done = True
             if self.winner == acting_player:
-                reward += 10  # Big reward for winning
+                reward += 30  # Big reward for winning
             else:
-                reward -= 10  # Big penalty for losing
+                reward -= 30  # Big penalty for losing
+
+        info["first_ball_hit"] = self.first_ball_hit.number if self.first_ball_hit else None
+        info["potted_count"] = len(shot_potted_balls)
         
         # Return the step results
         return self._get_observation(), reward, done, info
@@ -660,7 +770,7 @@ class PoolEnvironment:
         player_type = self.players[player_index]["type"]
         
         if player_type is None:
-            return 7  # Default is 7 (half of the balls excluding the 8-ball)
+            return sum(1 for ball in self.balls if not ball.potted and ball.number != 8)
         
         for ball in self.balls:
             if not ball.potted and ball.number != 8:

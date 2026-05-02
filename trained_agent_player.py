@@ -1,6 +1,7 @@
 import os
 
 from game_config import HEIGHT, WIDTH
+from shot_guidance import action_has_target_contact, guided_shot_from_observation
 
 
 class TrainedAgentPlayer:
@@ -9,6 +10,7 @@ class TrainedAgentPlayer:
         self.ready = False
         self.error = None
         self.ball_count = 15
+        self.state_object_balls = 15
         self.state_dim = None
 
         try:
@@ -41,7 +43,8 @@ class TrainedAgentPlayer:
                 return
 
             self.state_dim = int(first_layer.shape[1])
-            self.ball_count = self._ball_count_from_state_dim(self.state_dim)
+            self.state_object_balls = self._ball_count_from_state_dim(self.state_dim)
+            self.ball_count = self._payload_ball_count(payload, self.state_object_balls)
 
             cfg = PPOConfig()
             self.agent = PPO_Agent(self.state_dim, cfg)
@@ -69,15 +72,30 @@ class TrainedAgentPlayer:
             return 15
         return ball_count
 
+    def _payload_ball_count(self, payload, fallback):
+        try:
+            count = int(payload.get("ball_count", fallback))
+        except (TypeError, ValueError):
+            return fallback
+        return max(2, min(15, count))
+
     def choose_action(self, game):
         obs = self._game_to_observation(game)
-        state_vec = self.obs_to_compact_state(obs, WIDTH, HEIGHT)
+        state_vec = self.obs_to_compact_state(obs, WIDTH, HEIGHT, max_object_balls=self.state_object_balls)
         if state_vec.shape[0] != self.state_dim:
             raise ValueError(
-                f"AI expects {self.ball_count} balls, but current state has a different size."
+                f"AI expects {self.state_object_balls} state ball slots, but current state has a different size."
             )
         action, _, _, _ = self.agent.select_action(state_vec, deterministic=True)
-        return action
+        return self._stabilize_action(obs, action, game)
+
+    def _stabilize_action(self, obs, action, game):
+        power = float(action.get("power", 0.0))
+        if 3.0 <= power <= 20.0 and action_has_target_contact(obs, action):
+            return action
+
+        holes = getattr(game, "holes", None)
+        return guided_shot_from_observation(obs, WIDTH, HEIGHT, holes)
 
     def _game_to_observation(self, game):
         balls = [self._ball_state(game.cue_ball)]

@@ -53,7 +53,7 @@ def _count_remaining(balls: List[dict], player_type: str) -> float:
     return float(remaining) / 7.0
 
 
-def obs_to_compact_state(obs: dict, width: float, height: float) -> np.ndarray:
+def obs_to_compact_state(obs: dict, width: float, height: float, max_object_balls: int = 15) -> np.ndarray:
     """
     Compact MDP state:
     For each ball (ordered): (x_norm, y_norm, potted, is_striped, is_eight, is_cue)
@@ -63,6 +63,7 @@ def obs_to_compact_state(obs: dict, width: float, height: float) -> np.ndarray:
     + should_hit_8_ball, remaining_balls
     """
     balls = obs["balls"]
+    max_object_balls = max(1, min(15, int(max_object_balls)))
 
     cue_ball = None
     other_balls = []
@@ -75,8 +76,26 @@ def obs_to_compact_state(obs: dict, width: float, height: float) -> np.ndarray:
     if cue_ball is None and balls:
         cue_ball = balls[0]
         other_balls = balls[1:]
+    elif cue_ball is None:
+        cue_ball = {
+            "x": width * 0.25,
+            "y": height * 0.5,
+            "potted": False,
+            "is_striped": False,
+            "number": 0,
+        }
 
-    ordered = [cue_ball] + sorted(other_balls, key=lambda b: b.get("number", 0))
+    ordered_objects = sorted(other_balls, key=lambda b: b.get("number", 0))[:max_object_balls]
+    while len(ordered_objects) < max_object_balls:
+        ordered_objects.append({
+            "x": 0.0,
+            "y": 0.0,
+            "potted": True,
+            "is_striped": False,
+            "number": -1,
+        })
+
+    ordered = [cue_ball] + ordered_objects
 
     vec = []
     for b in ordered:
@@ -209,6 +228,28 @@ class PPO_Agent:
         power = self.cfg.power_min + u[1] * (self.cfg.power_max - self.cfg.power_min)
         return {"angle": float(angle), "power": float(power)}
 
+    def action_to_tanh(self, action: Dict[str, float]) -> np.ndarray:
+        angle_range = self.cfg.angle_max - self.cfg.angle_min
+        power_range = self.cfg.power_max - self.cfg.power_min
+        angle = float(action.get("angle", self.cfg.angle_min))
+        power = float(action.get("power", self.cfg.power_min))
+
+        angle_u = (angle - self.cfg.angle_min) / angle_range
+        power_u = (power - self.cfg.power_min) / power_range
+        a_tanh = np.array([angle_u * 2.0 - 1.0, power_u * 2.0 - 1.0], dtype=np.float32)
+        return np.clip(a_tanh, -0.999, 0.999)
+
+    @torch.no_grad()
+    def logp_value_for_action(self, state_vec: np.ndarray, action_tanh: np.ndarray) -> Tuple[float, float]:
+        s = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        a = torch.tensor(action_tanh, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mu, std, v = self.net(s)
+        dist = torch.distributions.Normal(mu, std)
+        pre_tanh = torch.atanh(a.clamp(-0.999, 0.999))
+        logp = dist.log_prob(pre_tanh).sum(dim=-1)
+        logp -= torch.log(1 - a.pow(2) + 1e-6).sum(dim=-1)
+        return float(logp.item()), float(v.item())
+
     @torch.no_grad()
     def select_action(self, state_vec: np.ndarray, deterministic: bool = False) -> Tuple[Dict[str, float], float, float, np.ndarray]:
        
@@ -233,6 +274,21 @@ class PPO_Agent:
         s = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         _, _, v = self.net(s)
         return float(v.item())
+
+    def imitation_update(self, state_vec: np.ndarray, action_tanh: np.ndarray) -> float:
+        s = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        target = torch.tensor(action_tanh, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mu, _, _ = self.net(s)
+        pred = torch.tanh(mu)
+        loss = (pred - target).pow(2).mean()
+        if not torch.isfinite(loss):
+            return 0.0
+
+        self.opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.net.parameters(), self.cfg.max_grad_norm)
+        self.opt.step()
+        return float(loss.item())
 
     def _gae(self, rewards, values, dones):
         cfg = self.cfg       
