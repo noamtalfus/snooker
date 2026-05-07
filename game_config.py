@@ -29,9 +29,8 @@ PLAYER2_COLOR = (30, 150, 30)
 
 
 
-screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
-info = pygame.display.Info()
-WIDTH, HEIGHT = info.current_w, info.current_h
+IS_FULLSCREEN = False
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.SCALED)
 pygame.display.set_caption("8-Ball Pool")
 clock = pygame.time.Clock()
 
