@@ -30,7 +30,7 @@ class PoolGame:
         self.training_layout = "rack"
         self.training_random_balls = False
         self.training_opponent = "random"  # random | self | none
-        self.training_workout_plan = True
+        self.training_workout_plan = False
         self.training_weird_graphics = False
         self.training_dropdown_open = None
         self.training_control_rects = {}
@@ -60,6 +60,7 @@ class PoolGame:
         self.target_ball = None  # 8-ball in the final stage
         self.first_ball_hit = None
         self.winner = None
+        self.shot_motion_frames = 0
        
     def setup_balls(self):
         balls = []
@@ -195,6 +196,7 @@ class PoolGame:
                 self.balls_moving = True
                 self.shot_potted_ball = False
                 self.first_ball_hit = None
+                self.shot_motion_frames = 0
 
 
 
@@ -248,7 +250,7 @@ class PoolGame:
             self.ai_status_text = self.trained_agent.error or "Trained AI is not ready."
             return
 
-        label = "trained AI" if self.trained_agent.using_policy else "built-in AI"
+        label = "trained AI" if self.trained_agent.using_policy else "stable shot planner"
         self.ai_status_text = f"Playing against {label} (15 balls)"
         self.reset_game(15, True)
         self.state = GAME
@@ -259,7 +261,7 @@ class PoolGame:
             ball_count=ball_count,
             random_balls=random_balls,
             opponent_type=opponent_type,
-            resume_checkpoint=False,
+            resume_checkpoint=workout_plan,
             layout=layout,
             workout_plan=workout_plan
         )
@@ -422,6 +424,7 @@ class PoolGame:
         self.balls_moving = True
         self.shot_potted_ball = False
         self.first_ball_hit = None
+        self.shot_motion_frames = 0
         self.ai_shot_delay = 45
    
     def update_game(self):
@@ -429,22 +432,20 @@ class PoolGame:
             self.take_ai_shot()
 
         if self.balls_moving:
+            self.shot_motion_frames += 1
             
             collided_balls = self.check_first_collision()
             if collided_balls and not self.first_ball_hit:
                 self.first_ball_hit = collided_balls
            
             
-            all_stopped = True
             for ball in [self.cue_ball] + self.balls:
                 if not ball.potted:
                     ball.move()
-                    if abs(ball.vx) > 0.1 or abs(ball.vy) > 0.1:
-                        all_stopped = False
            
-            collision_occurred = self.handle_collisions()
-            if collision_occurred:
-                all_stopped = False
+            self.handle_collisions()
+            self.settle_slow_balls()
+            all_stopped = not self.any_ball_moving()
            
             
             potted_balls = []
@@ -466,8 +467,11 @@ class PoolGame:
                 self.cue_ball.potted = True
                 self.turn_ended = True
            
-            if all_stopped:
+            if all_stopped or self.shot_motion_frames >= 900:
+                if self.shot_motion_frames >= 900:
+                    self.force_stop_balls()
                 self.balls_moving = False
+                self.shot_motion_frames = 0
 
                 if self.winner is None and self.balls and all(ball.potted for ball in self.balls):
                     self.winner = self.current_player
@@ -484,6 +488,26 @@ class PoolGame:
                 # Check for game over condition
                 if self.check_game_over():
                     self.state = GAME_OVER
+
+    def any_ball_moving(self):
+        for ball in [self.cue_ball] + self.balls:
+            if not ball.potted and (abs(ball.vx) > 0.12 or abs(ball.vy) > 0.12):
+                return True
+        return False
+
+    def settle_slow_balls(self):
+        for ball in [self.cue_ball] + self.balls:
+            if ball.potted:
+                continue
+            if abs(ball.vx) < 0.12:
+                ball.vx = 0
+            if abs(ball.vy) < 0.12:
+                ball.vy = 0
+
+    def force_stop_balls(self):
+        for ball in [self.cue_ball] + self.balls:
+            ball.vx = 0
+            ball.vy = 0
    
     def check_first_collision(self):
         """Check for the first ball the cue ball hits"""
@@ -648,41 +672,47 @@ class PoolGame:
         min_dist = ball1.radius + ball2.radius
        
         if distance < min_dist:
-            # Collision detected - calculate collision response
-            angle = math.atan2(dy, dx)
-           
-            # Move balls apart to prevent sticking
-            overlap = min_dist - distance
-            ball1.x -= overlap * math.cos(angle) / 2
-            ball1.y -= overlap * math.sin(angle) / 2
-            ball2.x += overlap * math.cos(angle) / 2
-            ball2.y += overlap * math.sin(angle) / 2
-           
-            # Calculate new velocities using conservation of momentum
+            if distance <= 1e-6:
+                rel_x = ball2.vx - ball1.vx
+                rel_y = ball2.vy - ball1.vy
+                angle = math.atan2(rel_y, rel_x) if abs(rel_x) > 1e-6 or abs(rel_y) > 1e-6 else 0.0
+                nx = math.cos(angle)
+                ny = math.sin(angle)
+            else:
+                nx = dx / distance
+                ny = dy / distance
+
+            overlap = min_dist - max(distance, 1e-6) + 0.01
+            ball1.x -= overlap * nx / 2
+            ball1.y -= overlap * ny / 2
+            ball2.x += overlap * nx / 2
+            ball2.y += overlap * ny / 2
+
+            relative_speed = (ball2.vx - ball1.vx) * nx + (ball2.vy - ball1.vy) * ny
+            if relative_speed >= 0:
+                return False
+
+            angle = math.atan2(ny, nx)
             v1 = math.hypot(ball1.vx, ball1.vy)
             v2 = math.hypot(ball2.vx, ball2.vy)
-           
             dir1 = math.atan2(ball1.vy, ball1.vx) if v1 > 0 else 0
             dir2 = math.atan2(ball2.vy, ball2.vx) if v2 > 0 else 0
-           
-            # Compute new velocities (simplified physics)
+
             new_x_vel1 = v2 * math.cos(dir2 - angle) * math.cos(angle)
             new_y_vel1 = v2 * math.cos(dir2 - angle) * math.sin(angle)
             new_x_vel2 = v1 * math.cos(dir1 - angle) * math.cos(angle)
             new_y_vel2 = v1 * math.cos(dir1 - angle) * math.sin(angle)
-           
-            # Update velocities
-            ball1.vx = new_x_vel1 * 0.95  # Small damping factor
+
+            ball1.vx = new_x_vel1 * 0.95
             ball1.vy = new_y_vel1 * 0.95
             ball2.vx = new_x_vel2 * 0.95
             ball2.vy = new_y_vel2 * 0.95
-           
-            # Add tangential velocities back
-            ball1.vx += v1 * math.sin(dir1 - angle) * math.cos(angle + math.pi/2) * 0.95
-            ball1.vy += v1 * math.sin(dir1 - angle) * math.sin(angle + math.pi/2) * 0.95
-            ball2.vx += v2 * math.sin(dir2 - angle) * math.cos(angle + math.pi/2) * 0.95
-            ball2.vy += v2 * math.sin(dir2 - angle) * math.sin(angle + math.pi/2) * 0.95
-           
+
+            ball1.vx += v1 * math.sin(dir1 - angle) * math.cos(angle + math.pi / 2) * 0.95
+            ball1.vy += v1 * math.sin(dir1 - angle) * math.sin(angle + math.pi / 2) * 0.95
+            ball2.vx += v2 * math.sin(dir2 - angle) * math.cos(angle + math.pi / 2) * 0.95
+            ball2.vy += v2 * math.sin(dir2 - angle) * math.sin(angle + math.pi / 2) * 0.95
+
             play_sound("ball_collision")
             return True
         return False

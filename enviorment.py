@@ -43,10 +43,13 @@ class Ball:
     
     def in_hole(self, holes, hole_radius):
         for hx, hy in holes:
-            if math.hypot(self.x - hx, self.y - hy) < hole_radius:
+            if math.hypot(self.x - hx, self.y - hy) < self.pocket_capture_radius(hole_radius):
                 self.potted = True
                 return True
         return False
+
+    def pocket_capture_radius(self, hole_radius):
+        return hole_radius + self.radius * 1.5
     
     def get_state(self):
         """Return a dictionary representing the ball's state."""
@@ -106,10 +109,10 @@ class PoolEnvironment:
         self.cue_ball = None
         self.balls = []
         self.ball_count = self._clamp_ball_count(ball_count)
-        self.max_shots = max(30, self.ball_count * 12)
         self.shots_taken = 0
         self.random_balls = bool(random_balls)
         self.layout = self._normalize_layout(layout)
+        self.max_shots = self._shot_limit()
         self.players = [
             {"name": "Player 1", "type": None, "score": 0, "color": (200, 30, 30)},
             {"name": "Player 2", "type": None, "score": 0, "color": (30, 150, 30)}
@@ -136,13 +139,19 @@ class PoolEnvironment:
 
     def set_ball_count(self, count: int):
         self.ball_count = self._clamp_ball_count(count)
-        self.max_shots = max(30, self.ball_count * 12)
+        self.max_shots = self._shot_limit()
+
+    def _shot_limit(self):
+        if self.layout == "beginner":
+            return max(10, self.ball_count * 4)
+        return max(30, self.ball_count * 12)
 
     def set_random_balls(self, enabled: bool):
         self.random_balls = bool(enabled)
 
     def set_layout(self, layout: str):
         self.layout = self._normalize_layout(layout)
+        self.max_shots = self._shot_limit()
 
     def _normalize_layout(self, layout: str) -> str:
         layout = str(layout or "rack").lower()
@@ -376,41 +385,47 @@ class PoolEnvironment:
         min_dist = ball1.radius + ball2.radius
         
         if distance < min_dist:
-            # Collision detected - calculate collision response
-            angle = math.atan2(dy, dx)
-            
-            # Move balls apart to prevent sticking
-            overlap = min_dist - distance
-            ball1.x -= overlap * math.cos(angle) / 2
-            ball1.y -= overlap * math.sin(angle) / 2
-            ball2.x += overlap * math.cos(angle) / 2
-            ball2.y += overlap * math.sin(angle) / 2
-            
-            # Calculate new velocities using conservation of momentum
+            if distance <= 1e-6:
+                rel_x = ball2.vx - ball1.vx
+                rel_y = ball2.vy - ball1.vy
+                angle = math.atan2(rel_y, rel_x) if abs(rel_x) > 1e-6 or abs(rel_y) > 1e-6 else 0.0
+                nx = math.cos(angle)
+                ny = math.sin(angle)
+            else:
+                nx = dx / distance
+                ny = dy / distance
+
+            overlap = min_dist - max(distance, 1e-6) + 0.01
+            ball1.x -= overlap * nx / 2
+            ball1.y -= overlap * ny / 2
+            ball2.x += overlap * nx / 2
+            ball2.y += overlap * ny / 2
+
+            relative_speed = (ball2.vx - ball1.vx) * nx + (ball2.vy - ball1.vy) * ny
+            if relative_speed >= 0:
+                return False
+
+            angle = math.atan2(ny, nx)
             v1 = math.hypot(ball1.vx, ball1.vy)
             v2 = math.hypot(ball2.vx, ball2.vy)
-            
             dir1 = math.atan2(ball1.vy, ball1.vx) if v1 > 0 else 0
             dir2 = math.atan2(ball2.vy, ball2.vx) if v2 > 0 else 0
-            
-            # Compute new velocities (simplified physics)
+
             new_x_vel1 = v2 * math.cos(dir2 - angle) * math.cos(angle)
             new_y_vel1 = v2 * math.cos(dir2 - angle) * math.sin(angle)
             new_x_vel2 = v1 * math.cos(dir1 - angle) * math.cos(angle)
             new_y_vel2 = v1 * math.cos(dir1 - angle) * math.sin(angle)
-            
-            # Update velocities
-            ball1.vx = new_x_vel1 * 0.95  # Small damping factor
+
+            ball1.vx = new_x_vel1 * 0.95
             ball1.vy = new_y_vel1 * 0.95
             ball2.vx = new_x_vel2 * 0.95
             ball2.vy = new_y_vel2 * 0.95
-            
-            # Add tangential velocities back
-            ball1.vx += v1 * math.sin(dir1 - angle) * math.cos(angle + math.pi/2) * 0.95
-            ball1.vy += v1 * math.sin(dir1 - angle) * math.sin(angle + math.pi/2) * 0.95
-            ball2.vx += v2 * math.sin(dir2 - angle) * math.cos(angle + math.pi/2) * 0.95
-            ball2.vy += v2 * math.sin(dir2 - angle) * math.sin(angle + math.pi/2) * 0.95
-            
+
+            ball1.vx += v1 * math.sin(dir1 - angle) * math.cos(angle + math.pi / 2) * 0.95
+            ball1.vy += v1 * math.sin(dir1 - angle) * math.sin(angle + math.pi / 2) * 0.95
+            ball2.vx += v2 * math.sin(dir2 - angle) * math.cos(angle + math.pi / 2) * 0.95
+            ball2.vy += v2 * math.sin(dir2 - angle) * math.sin(angle + math.pi / 2) * 0.95
+
             return True  # Collision occurred
         return False  # No collision
 
@@ -442,6 +457,12 @@ class PoolEnvironment:
         """Handle ball collisions with table cushions."""
         collision = False
         cushion_dampening = 0.8  # Energy loss on cushion hit
+
+        for hx, hy in self.holes:
+            if math.hypot(ball.x - hx, ball.y - hy) < ball.pocket_capture_radius(self.hole_radius):
+                ball.vx = 0
+                ball.vy = 0
+                return False
         
         if ball.x - ball.radius < 80:
             ball.x = 80 + ball.radius
@@ -460,6 +481,11 @@ class PoolEnvironment:
             ball.y = self.height - 80 - ball.radius
             ball.vy = -ball.vy * cushion_dampening
             collision = True
+
+        if abs(ball.vx) < 0.12:
+            ball.vx = 0
+        if abs(ball.vy) < 0.12:
+            ball.vy = 0
             
         return collision
     
@@ -702,14 +728,20 @@ class PoolEnvironment:
                 else:
                     reward -= 1.0
 
-        if self.layout == "beginner":
+        if self.layout == "beginner" or (self.layout == "rack" and self.ball_count <= 6):
             object_ball_potted = any(ball.number != 8 for ball in shot_potted_balls)
-            all_object_balls_potted = all(
-                ball.potted for ball in self.balls if ball.number != 8
+            potted_object_balls = sum(
+                1 for ball in self.balls if ball.number != 8 and ball.potted
             )
+            if self.ball_count <= 4:
+                required_object_pots = 1
+            elif self.ball_count <= 6:
+                required_object_pots = 2
+            else:
+                required_object_pots = min(3, self.ball_count - 1)
             if (
-                (self.ball_count <= 3 and object_ball_potted)
-                or (self.ball_count > 3 and all_object_balls_potted)
+                (self.ball_count <= 4 and object_ball_potted)
+                or (self.ball_count > 4 and potted_object_balls >= required_object_pots)
             ):
                 self.winner = acting_player
                 done = True

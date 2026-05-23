@@ -5,10 +5,17 @@ import random
 import numpy as np
 import wandb
 
-from shot_guidance import guided_shot_from_observation
+from checkpoint_utils import (
+    BEST_CHECKPOINT,
+    LATEST_CHECKPOINT,
+    canonical_checkpoint_path,
+    checkpoint_quality_score,
+    checkpoint_search_paths,
+)
+from shot_guidance import action_has_target_contact, guided_shot_from_observation
 
 class TrainingController:
-    def __init__(self, total_episodes=2000, ball_count=15, random_balls=False, opponent_type="random", resume_checkpoint=False, layout="rack", workout_plan=False):
+    def __init__(self, total_episodes=8000, ball_count=15, random_balls=False, opponent_type="random", resume_checkpoint=False, layout="rack", workout_plan=False):
         self.ready = False
         self.init_error = None
         self.closed = False
@@ -27,6 +34,15 @@ class TrainingController:
         self.opponent_type = self.target_opponent_type
         self.curriculum = []
         self.curriculum_stage = 0
+        self.curriculum_stage_start_ep = 0
+        self.stage_recent_wins = []
+        self.stage_recent_pots = []
+        self.stage_games = 0
+        self.stage_wins = 0
+        self.stage_pots = 0
+        self.stage_eval_win_rate = 0.0
+        self.stage_best_eval_win_rate = 0.0
+        self.best_curriculum_score = -1.0
         self.resume_checkpoint = bool(resume_checkpoint)
         try:
             from enviorment import PoolEnvironment
@@ -55,11 +71,12 @@ class TrainingController:
         self.cfg.rollout_steps = 256 if self._guided_training_enabled() else 512
         self.cfg.entropy_coef = 0.01 if self._guided_training_enabled() else 0.005
         self.agent = self.PPO_Agent(self.state_dim, self.cfg)
+        self._configure_learning_for_stage()
 
         self.ep = 0
         self.games = 0
         self.wins = 0
-        self.history = {"episode_reward": [], "win_rate": [], "eval_win_rate": []}
+        self.history = {"episode_reward": [], "win_rate": [], "lifetime_win_rate": [], "eval_win_rate": []}
         self.global_step = 0
         self.ep_update_stats = []
         self.training_progress_made = False
@@ -71,12 +88,16 @@ class TrainingController:
         self.total_pots = 0
         self.done = False
         self.paused = False
-        self.guided_warmup_episodes = 1200
-        self.guided_warmup_prob = 1.0
-        self.guided_assist_min_prob = 0.35
-        self.guided_assist_decay_episodes = 1800
+        self.guided_warmup_episodes = 0
+        self.guided_warmup_prob = 0.0
+        self.guided_assist_min_prob = 0.0
+        self.guided_assist_decay_episodes = 1
         self.guided_warmup_used = 0
         self.guided_imitation_loss = 0.0
+        self.guided_imitation_steps = 8
+        self.guided_replay_batch = 16
+        self.guided_replay_limit = 2048
+        self.guided_replay = []
 
         self.buffer = {"states": [], "actions_tanh": [], "logp": [], "values": [], "rewards": [], "dones": []}
         self.eval_interval = 20
@@ -84,12 +105,30 @@ class TrainingController:
         self.best_eval_win_rate = 0.0
         self.last_eval_win_rate = 0.0
 
-        self.checkpoint_path = os.path.join("checkpoints", "snooker_ppo_latest.pt")
-        self.best_checkpoint_path = os.path.join("checkpoints", "snooker_ppo_best.pt")
+        self.checkpoint_path = canonical_checkpoint_path(LATEST_CHECKPOINT)
+        self.best_checkpoint_path = canonical_checkpoint_path(BEST_CHECKPOINT)
         self._load_checkpoint_if_exists()
         self.wandb_run = self._init_wandb_run()
 
         self.ready = True
+
+    def _configure_learning_for_stage(self):
+        if not hasattr(self, "cfg") or not hasattr(self, "agent"):
+            return
+
+        if self.layout == "beginner":
+            self.cfg.lr = 2e-4
+            self.cfg.batch_size = 64
+            self.cfg.rollout_steps = 256
+            self.cfg.entropy_coef = 0.01
+        else:
+            self.cfg.lr = 1e-4
+            self.cfg.batch_size = 128
+            self.cfg.rollout_steps = 512
+            self.cfg.entropy_coef = 0.006
+
+        for group in self.agent.opt.param_groups:
+            group["lr"] = self.cfg.lr
 
     def _init_wandb_run(self):
         try:
@@ -151,7 +190,42 @@ class TrainingController:
             return "beginner"
         return "rack"
 
+    def _make_stage(
+        self,
+        name,
+        ball_count,
+        random_balls,
+        layout,
+        opponent_type,
+        min_episodes,
+        max_episodes,
+        mastery_win_rate,
+        mastery_pots=None,
+        guide_start=0.0,
+        guide_end=0.0,
+        advance_floor=0.0,
+        regression_floor=0.0,
+    ):
+        return {
+            "name": name,
+            "start_ep": 0,
+            "ball_count": max(2, min(15, int(ball_count))),
+            "random_balls": bool(random_balls),
+            "layout": self._normalize_layout(layout),
+            "opponent_type": opponent_type,
+            "min_episodes": int(min_episodes),
+            "max_episodes": int(max_episodes),
+            "mastery_win_rate": float(mastery_win_rate),
+            "mastery_pots": None if mastery_pots is None else float(mastery_pots),
+            "guide_start": float(guide_start),
+            "guide_end": float(guide_end),
+            "advance_floor": float(advance_floor),
+            "regression_floor": float(regression_floor),
+        }
+
     def _target_stage(self, name, start_ep):
+        beginner_guidance = self.target_layout == "beginner"
+        small_rack_guidance = self.target_layout == "rack" and self.target_ball_count <= 6
         return {
             "name": name,
             "start_ep": int(start_ep),
@@ -159,119 +233,138 @@ class TrainingController:
             "random_balls": self.target_random_balls,
             "layout": self.target_layout,
             "opponent_type": self.target_opponent_type,
+            "min_episodes": max(1, self.total_episodes),
+            "max_episodes": max(1, self.total_episodes),
+            "mastery_win_rate": 1.0,
+            "mastery_pots": None,
+            "guide_start": 1.0 if beginner_guidance else (0.65 if small_rack_guidance else 0.0),
+            "guide_end": 1.0 if beginner_guidance else (0.15 if small_rack_guidance else 0.0),
+            "advance_floor": 0.0,
+            "regression_floor": 0.0,
         }
 
+    def _stage_starts(self, stage_count):
+        if stage_count <= 1:
+            return [0]
+        step = max(8, self.total_episodes // stage_count)
+        return [step * i for i in range(stage_count)]
+
     def _build_workout_plan(self):
-        stage_count = 11 if self.target_random_balls else 10
-        if self.total_episodes < 1500:
-            step = max(10, self.total_episodes // stage_count)
-            starts = [step * i for i in range(stage_count)]
-        else:
-            starts = [0, 100, 220, 360, 540, 760, 1000, 1240, 1480, 1700, 1900]
+        stage_budget = max(120, self.total_episodes // 26)
+        short_min = max(30, int(stage_budget * 0.22))
+        normal_min = max(50, int(stage_budget * 0.32))
+        long_min = max(70, int(stage_budget * 0.42))
+        short_max = max(120, int(stage_budget * 0.85))
+        normal_max = max(180, int(stage_budget * 1.15))
+        long_max = max(260, int(stage_budget * 1.50))
+
+        def beginner_stage(name, balls, random_positions, opponent, min_ep, max_ep, win_rate, pots, guide_start, guide_end):
+            return self._make_stage(
+                name,
+                balls,
+                random_positions,
+                "beginner",
+                opponent,
+                min_ep,
+                max_ep,
+                win_rate,
+                pots,
+                guide_start,
+                guide_end,
+                advance_floor=max(0.35, win_rate - 0.18),
+                regression_floor=max(0.20, win_rate - 0.35),
+            )
+
+        def rack_stage(name, balls, random_positions, opponent, min_ep, max_ep, win_rate, pots=None, guide_start=0.30, guide_end=0.06):
+            return self._make_stage(
+                name,
+                balls,
+                random_positions,
+                "rack",
+                opponent,
+                min_ep,
+                max_ep,
+                win_rate,
+                pots,
+                guide_start,
+                guide_end,
+                advance_floor=max(0.18, win_rate - 0.15),
+                regression_floor=max(0.08, win_rate - 0.28),
+            )
 
         stages = [
-            {
-                "name": "1. Aim Warmup",
-                "start_ep": starts[0],
-                "ball_count": 2,
-                "random_balls": False,
-                "layout": "beginner",
-                "opponent_type": "none",
-            },
-            {
-                "name": "2. Three-Ball Drill",
-                "start_ep": starts[1],
-                "ball_count": 3,
-                "random_balls": False,
-                "layout": "beginner",
-                "opponent_type": "none",
-            },
-            {
-                "name": "3. Random Position Drill",
-                "start_ep": starts[2],
-                "ball_count": 3,
-                "random_balls": True,
-                "layout": "beginner",
-                "opponent_type": "none",
-            },
-            {
-                "name": "4. Five-Ball Solo",
-                "start_ep": starts[3],
-                "ball_count": 5,
-                "random_balls": True,
-                "layout": "beginner",
-                "opponent_type": "none",
-            },
-            {
-                "name": "5. Beginner vs Random",
-                "start_ep": starts[4],
-                "ball_count": 5,
-                "random_balls": True,
-                "layout": "beginner",
-                "opponent_type": "random",
-            },
-            {
-                "name": "6. Seven-Ball Beginner",
-                "start_ep": starts[5],
-                "ball_count": 7,
-                "random_balls": True,
-                "layout": "beginner",
-                "opponent_type": "random",
-            },
-            {
-                "name": "7. Small Rack",
-                "start_ep": starts[6],
-                "ball_count": 7,
-                "random_balls": False,
-                "layout": "rack",
-                "opponent_type": "random",
-            },
-            {
-                "name": "8. Medium Rack",
-                "start_ep": starts[7],
-                "ball_count": 10,
-                "random_balls": False,
-                "layout": "rack",
-                "opponent_type": "random",
-            },
-            {
-                "name": "9. Near-Full Rack",
-                "start_ep": starts[8],
-                "ball_count": 12,
-                "random_balls": False,
-                "layout": "rack",
-                "opponent_type": "random",
-            },
+            beginner_stage("2-Ball Guided Aim", 2, False, "none", normal_min, normal_max, 0.85, 1.0, 0.95, 0.55),
+            beginner_stage("2-Ball Policy Check", 2, False, "none", short_min, short_max, 0.85, 1.0, 0.30, 0.05),
+            beginner_stage("3-Ball Guided Aim", 3, False, "none", normal_min, normal_max, 0.82, 1.0, 0.90, 0.45),
+            beginner_stage("3-Ball Policy Check", 3, False, "none", short_min, short_max, 0.82, 1.0, 0.25, 0.05),
+            beginner_stage("4-Ball Guided Aim", 4, False, "none", normal_min, normal_max, 0.78, 1.0, 0.85, 0.35),
+            beginner_stage("4-Ball Policy Check", 4, False, "none", short_min, short_max, 0.78, 1.0, 0.20, 0.05),
+            beginner_stage("4-Ball Random Intro", 4, True, "none", normal_min, normal_max, 0.72, 1.0, 0.75, 0.25),
+            beginner_stage("4-Ball Random Check", 4, True, "none", short_min, short_max, 0.72, 1.0, 0.20, 0.05),
+            beginner_stage("5-Ball Pattern Pots", 5, True, "none", long_min, long_max, 0.68, 2.0, 0.65, 0.20),
+            beginner_stage("6-Ball Pattern Pots", 6, True, "none", long_min, long_max, 0.64, 2.0, 0.55, 0.15),
+            beginner_stage("6-Ball Opponent Intro", 6, True, "random", long_min, long_max, 0.58, 2.0, 0.45, 0.10),
+            beginner_stage("7-Ball Beginner Match", 7, True, "random", long_min, long_max, 0.54, 2.0, 0.35, 0.05),
+            beginner_stage("8-Ball Beginner Match", 8, True, "random", long_min, long_max, 0.50, 2.0, 0.25, 0.05),
+            rack_stage("2-Ball Rack Bridge", 2, False, "none", normal_min, long_max, 0.80, 1.0, 0.45, 0.12),
+            rack_stage("3-Ball Rack Bridge", 3, False, "none", normal_min, long_max, 0.70, 1.0, 0.40, 0.10),
+            rack_stage("4-Ball Rack Bridge", 4, False, "none", normal_min, long_max, 0.60, 1.0, 0.35, 0.08),
+            rack_stage("5-Ball Rack Solo", 5, False, "none", normal_min, long_max, 0.50, 1.0),
+            rack_stage("6-Ball Rack Solo", 6, False, "none", normal_min, long_max, 0.46, 1.0),
+            rack_stage("7-Ball Rack Solo", 7, False, "none", normal_min, long_max, 0.42, 1.0),
+            rack_stage("7-Ball Rack Opponent", 7, False, "random", normal_min, long_max, 0.38, 1.0),
+            rack_stage("8-Ball Rack Opponent", 8, False, "random", normal_min, long_max, 0.35, 1.0),
+            rack_stage("9-Ball Rack Opponent", 9, False, "random", normal_min, long_max, 0.32, 1.0),
+            rack_stage("10-Ball Rack Opponent", 10, False, "random", normal_min, long_max, 0.30, 1.0),
+            rack_stage("11-Ball Rack Opponent", 11, False, "random", normal_min, long_max, 0.28, 1.0),
+            rack_stage("12-Ball Rack Opponent", 12, False, "random", normal_min, long_max, 0.26, 1.0),
+            rack_stage("13-Ball Rack Opponent", 13, False, "random", normal_min, long_max, 0.24, 1.0),
+            rack_stage("14-Ball Rack Opponent", 14, False, "random", normal_min, long_max, 0.22, 1.0),
+            rack_stage("15-Ball Rack Prep", 15, False, "random", long_min, long_max, 0.20, 1.0),
         ]
 
         if self.target_random_balls:
-            stages.append({
-                "name": "10. Random Full Rack Prep",
-                "start_ep": starts[9],
-                "ball_count": 15,
-                "random_balls": True,
-                "layout": "rack",
-                "opponent_type": "random",
-            })
-            stages.append(self._target_stage("11. Target Game", starts[10]))
-        else:
-            stages.append(self._target_stage("10. Target Game", starts[9]))
+            stages.append(rack_stage("15-Ball Random Rack Prep", 15, True, "random", long_min, long_max, 0.18, 1.0))
 
-        compact = []
-        for stage in stages:
-            if compact and all(compact[-1][key] == stage[key] for key in ("ball_count", "random_balls", "layout", "opponent_type")):
-                continue
-            compact.append(stage)
-        return compact
+        stages.append(self._make_stage(
+            "Target Game",
+            self.target_ball_count,
+            self.target_random_balls,
+            self.target_layout,
+            self.target_opponent_type,
+            long_min,
+            max(long_max, int(stage_budget * 2.0)),
+            0.18 if self.target_layout == "rack" else 0.50,
+            1.0,
+            0.10 if self.target_layout == "beginner" else 0.0,
+            0.0,
+            0.0,
+            0.0,
+        ))
+
+        starts = self._stage_starts(len(stages))
+        for index, stage in enumerate(stages):
+            stage["name"] = f"{index + 1}. {stage['name']}"
+            stage["start_ep"] = starts[index]
+        return stages
 
     def _apply_curriculum_stage(self, index, create_env=False):
         index = max(0, min(index, len(self.curriculum) - 1))
         stage = self.curriculum[index]
         self.curriculum_stage = index
+        self.curriculum_stage_start_ep = self.ep if hasattr(self, "ep") else int(stage["start_ep"])
+        self.stage_recent_wins = []
+        self.stage_recent_pots = []
+        self.stage_games = 0
+        self.stage_wins = 0
+        self.stage_pots = 0
+        self.stage_eval_win_rate = 0.0
+        self.stage_best_eval_win_rate = 0.0
         self.max_ball_count = int(stage["ball_count"])
         self.random_balls = bool(stage["random_balls"])
         self.layout = self._normalize_layout(stage["layout"])
         self.opponent_type = stage["opponent_type"]
+        self._configure_learning_for_stage()
 
         if create_env:
             self.env = self.PoolEnvironment(
@@ -298,18 +391,77 @@ class TrainingController:
         self.ep_update_stats = []
         self.buffer = {"states": [], "actions_tanh": [], "logp": [], "values": [], "rewards": [], "dones": []}
 
+    def _remember_guided_example(self, state_vec, action_tanh):
+        self.guided_replay.append((np.array(state_vec, dtype=np.float32), np.array(action_tanh, dtype=np.float32)))
+        if len(self.guided_replay) > self.guided_replay_limit:
+            self.guided_replay = self.guided_replay[-self.guided_replay_limit:]
+
+    def _guided_imitation_update(self, state_vec, action_tanh):
+        self._remember_guided_example(state_vec, action_tanh)
+        losses = []
+        for _ in range(self.guided_imitation_steps):
+            losses.append(self.agent.imitation_update(state_vec, action_tanh))
+
+        batch_size = min(self.guided_replay_batch, len(self.guided_replay))
+        if batch_size > 0:
+            for replay_state, replay_action in random.sample(self.guided_replay, batch_size):
+                losses.append(self.agent.imitation_update(replay_state, replay_action))
+
+        return float(np.mean(losses)) if losses else 0.0
+
     def _maybe_advance_curriculum(self):
         if not self.workout_plan or self.curriculum_stage >= len(self.curriculum) - 1:
             return
-        next_stage = self.curriculum[self.curriculum_stage + 1]
-        if self.ep >= int(next_stage["start_ep"]):
+        if self._stage_mastered():
             self._apply_curriculum_stage(self.curriculum_stage + 1)
 
     def _beginner_drill_enabled(self):
         return self.layout == "beginner" and self.max_ball_count == 2 and self.opponent_type == "none"
 
     def _guided_training_enabled(self):
-        return self.layout == "beginner"
+        stage = self._current_stage()
+        return float(stage.get("guide_start", 0.0)) > 0.0 or float(stage.get("guide_end", 0.0)) > 0.0
+
+    def _current_stage(self):
+        if not self.curriculum:
+            return {}
+        return self.curriculum[self.curriculum_stage]
+
+    def _episodes_in_stage(self):
+        return max(0, self.ep - self.curriculum_stage_start_ep)
+
+    def _stage_mastered(self):
+        stage = self._current_stage()
+        episodes_in_stage = self._episodes_in_stage()
+        min_stage_episodes = int(stage.get("min_episodes", 0))
+        max_stage_episodes = int(stage.get("max_episodes", max(1, min_stage_episodes)))
+        required_win_rate = float(stage.get("mastery_win_rate", 0.5))
+        advance_floor = float(stage.get("advance_floor", max(0.0, required_win_rate - 0.25)))
+
+        if episodes_in_stage < min_stage_episodes:
+            return False
+
+        recent_games = min(20, len(self.stage_recent_wins))
+        if recent_games == 0 or self.stage_eval_win_rate <= 0.0:
+            return False
+
+        recent_win_rate = sum(self.stage_recent_wins[-recent_games:]) / recent_games
+        recent_pots = self.stage_recent_pots[-recent_games:]
+        avg_pots = sum(recent_pots) / recent_games
+        required_pots = stage.get("mastery_pots")
+        pots_ready = required_pots is None or avg_pots >= float(required_pots)
+        eval_ready = self.stage_eval_win_rate >= required_win_rate
+        recent_ready = recent_win_rate >= max(advance_floor, required_win_rate - 0.10)
+
+        if eval_ready and recent_ready and pots_ready:
+            return True
+
+        if episodes_in_stage >= max_stage_episodes:
+            regression_floor = float(stage.get("regression_floor", max(0.0, advance_floor - 0.15)))
+            if self.stage_eval_win_rate >= advance_floor and recent_win_rate >= regression_floor and pots_ready:
+                return True
+
+        return False
 
     def _checkpoint_payload(self):
         return {
@@ -324,6 +476,7 @@ class TrainingController:
             "hits": self.total_hits,
             "pots": self.total_pots,
             "best_eval_win_rate": self.best_eval_win_rate,
+            "best_curriculum_score": self.best_curriculum_score,
             "ball_count": self.target_ball_count,
             "layout": self.target_layout,
             "random_balls": self.target_random_balls,
@@ -336,11 +489,32 @@ class TrainingController:
     def _save_checkpoint(self, best=False):
         try:
             os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-            self.torch.save(self._checkpoint_payload(), self.checkpoint_path)
+            payload = self._checkpoint_payload()
+            self.torch.save(payload, self.checkpoint_path)
             if best:
-                self.torch.save(self._checkpoint_payload(), self.best_checkpoint_path)
+                existing = self._best_existing_payload()
+                existing_score = checkpoint_quality_score(existing) if existing else -1.0
+                new_score = checkpoint_quality_score(payload)
+                if existing is None or new_score > existing_score + 1e-6:
+                    self.torch.save(payload, self.best_checkpoint_path)
         except Exception:
             pass
+
+    def _best_existing_payload(self):
+        best_payload = None
+        best_score = None
+        for path in checkpoint_search_paths():
+            if not os.path.exists(path):
+                continue
+            try:
+                payload = self.torch.load(path, map_location=self.agent.device)
+            except Exception:
+                continue
+            score = checkpoint_quality_score(payload)
+            if best_payload is None or score > best_score:
+                best_payload = payload
+                best_score = score
+        return best_payload
 
     def _torch_state_is_finite(self, value):
         if self.torch.is_tensor(value):
@@ -354,39 +528,38 @@ class TrainingController:
         return True
 
     def _load_checkpoint_if_exists(self):
-        if not self.resume_checkpoint:
-            print("Starting a fresh training session without loading checkpoint weights.")
+        checkpoint = self._find_best_compatible_checkpoint()
+        if checkpoint is None:
             return
-        if not os.path.exists(self.checkpoint_path):
-            return
+        path, payload, model_state = checkpoint
         try:
-            payload = self.torch.load(self.checkpoint_path, map_location=self.agent.device)
-            model_state = payload.get("model")
-            if not isinstance(model_state, dict) or not self._torch_state_is_finite(model_state):
-                print(f"Skipping invalid checkpoint model: {self.checkpoint_path}")
-                return
-
-            first_layer = model_state.get("shared.0.weight")
-            if first_layer is not None and int(first_layer.shape[1]) != self.state_dim:
-                print("Skipping checkpoint with old state size. Start a new training run.")
-                return
-
             self.agent.net.load_state_dict(model_state)
 
             optimizer_state = payload.get("optimizer")
-            if isinstance(optimizer_state, dict) and self._torch_state_is_finite(optimizer_state):
+            if self.resume_checkpoint and isinstance(optimizer_state, dict) and self._torch_state_is_finite(optimizer_state):
                 self.agent.opt.load_state_dict(optimizer_state)
-            else:
+            elif self.resume_checkpoint:
                 print("Skipping invalid checkpoint optimizer state.")
 
-            for attr in ("reward_mean", "reward_var", "reward_count"):
-                value = float(payload.get(attr, getattr(self.agent, attr)))
-                if math.isfinite(value):
-                    setattr(self.agent, attr, value)
+            if self.resume_checkpoint:
+                for attr in ("reward_mean", "reward_var", "reward_count"):
+                    value = float(payload.get(attr, getattr(self.agent, attr)))
+                    if math.isfinite(value):
+                        setattr(self.agent, attr, value)
 
-            best_eval_win_rate = float(payload.get("best_eval_win_rate", self.best_eval_win_rate))
-            if math.isfinite(best_eval_win_rate):
-                self.best_eval_win_rate = best_eval_win_rate
+            try:
+                best_eval_win_rate = float(payload.get("best_eval_win_rate", self.best_eval_win_rate))
+                if math.isfinite(best_eval_win_rate):
+                    self.best_eval_win_rate = best_eval_win_rate
+            except (TypeError, ValueError):
+                pass
+
+            try:
+                best_curriculum_score = float(payload.get("best_curriculum_score", self.best_curriculum_score))
+                if math.isfinite(best_curriculum_score):
+                    self.best_curriculum_score = best_curriculum_score
+            except (TypeError, ValueError):
+                pass
 
             if self.resume_checkpoint:
                 self.ep = int(payload.get("ep", self.ep))
@@ -397,8 +570,36 @@ class TrainingController:
                 if self.workout_plan:
                     loaded_stage = int(payload.get("curriculum_stage", self.curriculum_stage))
                     self._apply_curriculum_stage(loaded_stage)
+            mode = "resumed" if self.resume_checkpoint else "warm-started"
+            print(f"Training {mode} from checkpoint: {path}")
         except Exception as exc:
             print(f"Checkpoint load skipped: {exc}")
+
+    def _find_best_compatible_checkpoint(self):
+        best = None
+        best_score = None
+        for path in checkpoint_search_paths():
+            if not os.path.exists(path):
+                continue
+            try:
+                payload = self.torch.load(path, map_location=self.agent.device)
+                model_state = payload.get("model") if isinstance(payload, dict) else None
+                if not isinstance(model_state, dict) or not self._torch_state_is_finite(model_state):
+                    print(f"Skipping invalid checkpoint model: {path}")
+                    continue
+
+                first_layer = model_state.get("shared.0.weight")
+                if first_layer is not None and int(first_layer.shape[1]) != self.state_dim:
+                    print(f"Skipping checkpoint with old state size: {path}")
+                    continue
+
+                score = checkpoint_quality_score(payload)
+                if best is None or score > best_score:
+                    best = (path, payload, model_state)
+                    best_score = score
+            except Exception as exc:
+                print(f"Checkpoint load skipped for {path}: {exc}")
+        return best
 
     def _random_action(self):
         angle = random.uniform(0, 2 * math.pi)
@@ -406,43 +607,104 @@ class TrainingController:
         return {"angle": angle, "power": power}
 
     def _guided_beginner_action(self):
+        obs = self.env._get_observation()
+        break_action = self._guided_rack_break_action(obs)
+        if break_action is not None:
+            return break_action
         return guided_shot_from_observation(
-            self.env._get_observation(),
+            obs,
             self.env.width,
             self.env.height,
             self.env.holes,
             jitter=0.0,
         )
 
+    def _guided_rack_break_action(self, obs):
+        if self.layout != "rack" or obs.get("ball_assignment_done"):
+            return None
+
+        cue = None
+        object_balls = []
+        for ball in obs.get("balls", []):
+            if ball.get("potted", False):
+                continue
+            if ball.get("number", 0) == 0:
+                cue = ball
+            else:
+                object_balls.append(ball)
+
+        if cue is None or len(object_balls) < 3:
+            return None
+
+        rack_x = sum(ball["x"] for ball in object_balls) / len(object_balls)
+        rack_y = sum(ball["y"] for ball in object_balls) / len(object_balls)
+        spread_x = max(ball["x"] for ball in object_balls) - min(ball["x"] for ball in object_balls)
+        spread_y = max(ball["y"] for ball in object_balls) - min(ball["y"] for ball in object_balls)
+        if rack_x < self.env.width * 0.55 or spread_x > 220 or spread_y > 180:
+            return None
+
+        return {
+            "angle": math.atan2(rack_y - cue["y"], rack_x - cue["x"]) % (2 * math.pi),
+            "power": 22.0,
+        }
+
     def _guided_action_probability(self):
         if not self._guided_training_enabled():
             return 0.0
-        if self.ep < self.guided_warmup_episodes:
-            return self.guided_warmup_prob
+        stage = self._current_stage()
+        guide_start = float(stage.get("guide_start", 0.0))
+        guide_end = float(stage.get("guide_end", 0.0))
+        if guide_start <= 0.0 and guide_end <= 0.0:
+            return 0.0
 
-        elapsed = self.ep - self.guided_warmup_episodes
-        decay = math.exp(-elapsed / max(1.0, self.guided_assist_decay_episodes))
-        return self.guided_assist_min_prob + (self.guided_warmup_prob - self.guided_assist_min_prob) * decay
+        min_episodes = max(1, int(stage.get("min_episodes", 1)))
+        progress = min(1.0, self._episodes_in_stage() / min_episodes)
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        guide_prob = guide_start + (guide_end - guide_start) * eased
+        return max(0.0, min(1.0, guide_prob))
 
     def _select_train_action(self, s_vec):
         guide_prob = self._guided_action_probability()
         if guide_prob > 0.0 and random.random() < guide_prob:
             action = self._guided_beginner_action()
             a_tanh = self.agent.action_to_tanh(action)
-            self.guided_imitation_loss = self.agent.imitation_update(s_vec, a_tanh)
+            self.guided_imitation_loss = self._guided_imitation_update(s_vec, a_tanh)
             logp, val = self.agent.logp_value_for_action(s_vec, a_tanh)
             self.guided_warmup_used += 1
             return action, logp, val, a_tanh
-        return self.agent.select_action(s_vec)
+
+        action, logp, val, a_tanh = self.agent.select_action(s_vec)
+        if self._guided_training_enabled():
+            power = float(action.get("power", 0.0))
+            if power < 4.0 or power > 22.0 or not action_has_target_contact(self.obs, action):
+                action = self._guided_beginner_action()
+                a_tanh = self.agent.action_to_tanh(action)
+                self.guided_imitation_loss = self._guided_imitation_update(s_vec, a_tanh)
+                logp, val = self.agent.logp_value_for_action(s_vec, a_tanh)
+                self.guided_warmup_used += 1
+        return action, logp, val, a_tanh
 
     def _finish_episode(self):
         self.games += 1
         win = 1 if self.env.winner == 0 else 0
         if win:
             self.wins += 1
+        self.stage_games += 1
+        if win:
+            self.stage_wins += 1
+        self.stage_pots += self.ep_pots
 
         self.history["episode_reward"].append(self.ep_reward)
-        self.history["win_rate"].append(self.wins / self.games)
+        self.stage_recent_wins.append(win)
+        self.stage_recent_pots.append(self.ep_pots)
+        if len(self.stage_recent_wins) > 30:
+            self.stage_recent_wins = self.stage_recent_wins[-30:]
+            self.stage_recent_pots = self.stage_recent_pots[-30:]
+        rolling_games = max(1, len(self.stage_recent_wins))
+        rolling_win_rate = sum(self.stage_recent_wins) / rolling_games
+        lifetime_win_rate = self.wins / self.games
+        self.history["win_rate"].append(rolling_win_rate)
+        self.history["lifetime_win_rate"].append(lifetime_win_rate)
         self.ep += 1
 
         if self.ep_update_stats:
@@ -466,7 +728,10 @@ class TrainingController:
         p2_remaining = float(self.env.count_remaining_balls(1))
         winner = int(self.env.winner) if self.env.winner is not None else -1
         win_rate = self.history["win_rate"][-1]
+        lifetime_win_rate = self.history["lifetime_win_rate"][-1]
         win_percentage = win_rate * 100.0
+        stage_win_rate = 0.0 if self.stage_games == 0 else self.stage_wins / self.stage_games
+        stage_avg_pots = 0.0 if self.stage_games == 0 else self.stage_pots / self.stage_games
 
         if self.wandb_run is not None:
             wandb.log({
@@ -485,6 +750,14 @@ class TrainingController:
                 "num_matches": self.games,
                 "win_rate": win_rate,
                 "win_percentage": win_percentage,
+                "rolling_win_rate": win_rate,
+                "rolling_win_percentage": win_percentage,
+                "lifetime_win_rate": lifetime_win_rate,
+                "lifetime_win_percentage": lifetime_win_rate * 100.0,
+                "stage_win_rate": stage_win_rate,
+                "stage_avg_pots": stage_avg_pots,
+                "stage_eval_win_rate": self.stage_eval_win_rate,
+                "stage_best_eval_win_rate": self.stage_best_eval_win_rate,
                 "eval_win_rate": self.last_eval_win_rate,
                 "best_eval_win_rate": self.best_eval_win_rate,
                 "game_type": self._game_type_label(),
@@ -514,9 +787,13 @@ class TrainingController:
 
         if self.ep % self.eval_interval == 0:
             self.last_eval_win_rate = self._evaluate_policy(self.eval_episodes)
+            self.stage_eval_win_rate = self.last_eval_win_rate
+            self.stage_best_eval_win_rate = max(self.stage_best_eval_win_rate, self.stage_eval_win_rate)
             self.history["eval_win_rate"].append(self.last_eval_win_rate)
-            is_best = self.last_eval_win_rate >= self.best_eval_win_rate
+            eval_score = (self.curriculum_stage + self.last_eval_win_rate) if self.workout_plan else self.last_eval_win_rate
+            is_best = eval_score >= self.best_curriculum_score
             if is_best:
+                self.best_curriculum_score = eval_score
                 self.best_eval_win_rate = self.last_eval_win_rate
             self._save_checkpoint(best=is_best)
         elif self.ep % 5 == 0:
@@ -540,7 +817,7 @@ class TrainingController:
             layout=self.layout
         )
         wins = 0
-        max_turns = 80
+        max_turns = max(20, int(eval_env.max_shots) + 10)
         for _ in range(episodes):
             obs = eval_env.reset()
             done = False
@@ -550,16 +827,9 @@ class TrainingController:
                 if eval_env.current_player == 0:
                     action, _, _, _ = self.agent.select_action(s_vec, deterministic=True)
                     if self._guided_training_enabled():
-                        guided_action = guided_shot_from_observation(
-                            obs,
-                            eval_env.width,
-                            eval_env.height,
-                            eval_env.holes,
-                        )
-                        guided_tanh = self.agent.action_to_tanh(guided_action)
-                        policy_tanh = self.agent.action_to_tanh(action)
-                        if np.linalg.norm(policy_tanh - guided_tanh) > 0.35:
-                            action = guided_action
+                        power = float(action.get("power", 0.0))
+                        if power < 4.0 or power > 22.0 or not action_has_target_contact(obs, action):
+                            action = guided_shot_from_observation(obs, eval_env.width, eval_env.height, eval_env.holes)
                 else:
                     if self.opponent_type == "self":
                         action, _, _, _ = self.agent.select_action(s_vec, deterministic=True)
@@ -602,6 +872,7 @@ class TrainingController:
         if self.env.current_player == 0:
             action, logp, val, a_tanh = self._select_train_action(s_vec)
             next_obs, reward, done, info = self.env.step(action)
+            agent_reward = float(reward)
 
             if info.get("first_ball_hit") is not None:
                 self.ep_hits += 1
@@ -614,7 +885,7 @@ class TrainingController:
             self.buffer["actions_tanh"].append(a_tanh)
             self.buffer["logp"].append(logp)
             self.buffer["values"].append(val)
-            self.buffer["rewards"].append(float(reward))
+            self.buffer["rewards"].append(agent_reward)
             self.buffer["dones"].append(float(done))
         else:
             if self.opponent_type == "self":
@@ -622,11 +893,13 @@ class TrainingController:
                 next_obs, reward, done, _ = self.env.step(action)
             else:
                 next_obs, reward, done, _ = self.env.step(self._random_action())
+            agent_reward = -float(reward)
             if done and self.buffer["dones"]:
                 self.buffer["dones"][-1] = 1.0
+                self.buffer["rewards"][-1] += agent_reward
 
         self.obs = next_obs
-        self.ep_reward += float(reward)
+        self.ep_reward += agent_reward
         self.done = done
         self.global_step += 1
 
@@ -664,32 +937,45 @@ class TrainingController:
         if self.ep >= self.total_episodes:
             status = "Finished"
 
-        win_rate = 0.0 if self.games == 0 else self.wins / self.games
+        lifetime_win_rate = 0.0 if self.games == 0 else self.wins / self.games
+        win_rate = 0.0
+        if self.stage_recent_wins:
+            win_rate = sum(self.stage_recent_wins) / len(self.stage_recent_wins)
+        stage_win_rate = 0.0 if self.stage_games == 0 else self.stage_wins / self.stage_games
+        stage_avg_pots = 0.0 if self.stage_games == 0 else self.stage_pots / self.stage_games
         avg_hits = 0.0 if self.games == 0 else self.total_hits / self.games
         avg_pots = 0.0 if self.games == 0 else self.total_pots / self.games
         guide_prob = self._guided_action_probability()
-        if self._guided_training_enabled() and self.ep < self.guided_warmup_episodes:
-            guidance = f"Warmup {guide_prob:.0%}"
-        elif guide_prob > 0:
+        if guide_prob > 0:
             guidance = f"Assist {guide_prob:.0%}"
         else:
             guidance = "Off"
         if self.workout_plan:
             stage = self.curriculum[self.curriculum_stage]
+            stage_prefix = f"{self.curriculum_stage + 1}. "
+            stage_name = stage["name"]
+            if stage_name.startswith(stage_prefix):
+                stage_name = stage_name[len(stage_prefix):]
             plan_line = (
-                f"Workout: {self.curriculum_stage + 1}/{len(self.curriculum)} {stage['name']} "
+                f"Workout: {self.curriculum_stage + 1}/{len(self.curriculum)} {stage_name} "
                 f"| Target: {self.target_ball_count} balls, {self.target_layout.title()}, "
                 f"{'Random Positions' if self.target_random_balls else 'Fixed Positions'}, {self.target_opponent_type}"
             )
+            stage_line = (
+                f"Stage Episodes: {self._episodes_in_stage()}/{stage.get('min_episodes', 0)} min "
+                f"| max {stage.get('max_episodes', 0)} | Need Eval {stage.get('mastery_win_rate', 0.0):.2f}"
+            )
         else:
             plan_line = "Workout: Off"
+            stage_line = "Stage: Selected settings"
         lines = [
             f"Episode: {self.ep}/{self.total_episodes} | Status: {status}",
-            f"Episode Reward: {self.ep_reward:.2f} | Win Rate: {win_rate:.2f}",
-            f"Hits/Game: {avg_hits:.2f} | Pots/Game: {avg_pots:.2f} | Guidance: {guidance}",
+            f"Episode Reward: {self.ep_reward:.2f} | Recent WR: {win_rate:.2f} | Lifetime WR: {lifetime_win_rate:.2f} | Stage WR: {stage_win_rate:.2f}",
+            f"Hits/Game: {avg_hits:.2f} | Pots/Game: {avg_pots:.2f} | Stage Pots/Game: {stage_avg_pots:.2f}",
             f"Guided Shots: {self.guided_warmup_used} | Imitation Loss: {self.guided_imitation_loss:.4f}",
-            f"Eval Win Rate: {self.last_eval_win_rate:.2f} | Best: {self.best_eval_win_rate:.2f}",
+            f"Policy Eval: {self.stage_eval_win_rate:.2f} | Stage Best: {self.stage_best_eval_win_rate:.2f} | Guidance: {guidance}",
             plan_line,
+            stage_line,
             f"Balls: {self.max_ball_count} | Layout: {self.layout.title()} | Random Positions: {'On' if self.random_balls else 'Off'}",
             f"Opponent: {self.opponent_type}",
             f"Checkpoint: {self.checkpoint_path}",

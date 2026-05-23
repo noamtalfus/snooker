@@ -152,14 +152,14 @@ class PPO(nn.Module):
         )
 
         self.mu = nn.Linear(hidden, 2)
-        self.log_std = nn.Parameter(torch.zeros(2))
+        self.log_std = nn.Parameter(torch.full((2,), -0.7))
 
         self.v = nn.Linear(hidden, 1)
 
     def forward(self, x: torch.Tensor):
         h = self.shared(x)
         mu = torch.tanh(self.mu(h))               # (-1,1)
-        std = torch.exp(self.log_std).clamp(1e-3, 2.0)
+        std = torch.exp(self.log_std).clamp(1e-3, 1.0)
         value = self.v(h).squeeze(-1)
         return mu, std, value
     
@@ -175,6 +175,8 @@ class PPOConfig:
     entropy_coef: float = 0.005
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
+    target_kl: float = 0.03
+    value_clip: float = 10.0
     reward_norm: bool = True
     reward_clip: float = 5.0
     reward_eps: float = 1e-8
@@ -377,7 +379,8 @@ class PPO_Agent:
                     surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_b
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                value_loss = (ret_b - v).pow(2).mean()
+                value_error = (ret_b - v).clamp(-cfg.value_clip, cfg.value_clip)
+                value_loss = value_error.pow(2).mean()
                 entropy = dist.entropy().sum(dim=-1).mean()
 
                 loss = policy_loss + cfg.value_coef * value_loss - cfg.entropy_coef * entropy
@@ -388,6 +391,8 @@ class PPO_Agent:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
                 self.opt.step()
+                with torch.no_grad():
+                    self.net.log_std.clamp_(-2.0, 0.0)
 
                 policy_losses.append(float(policy_loss.item()))
                 value_losses.append(float(value_loss.item()))
@@ -395,6 +400,9 @@ class PPO_Agent:
                 total_losses.append(float(loss.item()))
                 approx_kls.append(float(approx_kl))
                 clip_fracs.append(float(clip_frac))
+
+            if approx_kls and float(np.mean(approx_kls[-max(1, math.ceil(n / cfg.batch_size)):])) > cfg.target_kl:
+                break
 
         return {
             "policy_loss": float(np.mean(policy_losses)) if policy_losses else 0.0,
@@ -445,21 +453,24 @@ class Trainer:
 
 
                     next_obs, reward, done, info = self.env.step(action)
+                    agent_reward = float(reward)
 
                     buffer["states"].append(s_vec)
                     buffer["actions_tanh"].append(a_tanh)
                     buffer["logp"].append(logp)
                     buffer["values"].append(val)
-                    buffer["rewards"].append(float(reward))
+                    buffer["rewards"].append(agent_reward)
                     buffer["dones"].append(float(done))
 
                 else:
                     next_obs, reward, done, info = self.env.step(self.opponent_policy())
+                    agent_reward = -float(reward)
                     if done and buffer["dones"]:
                         buffer["dones"][-1] = 1.0
+                        buffer["rewards"][-1] += agent_reward
 
                 obs = next_obs
-                ep_reward += float(reward)
+                ep_reward += agent_reward
                 ep_steps += 1
 
                 if len(buffer["states"]) >= cfg.rollout_steps or done:

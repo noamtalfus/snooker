@@ -26,6 +26,11 @@ class Ball:
         self.vy *= self.friction
         if abs(self.vx) < 0.1: self.vx = 0
         if abs(self.vy) < 0.1: self.vy = 0
+
+        if self.near_hole():
+            self.vx = 0
+            self.vy = 0
+            return
        
         # Check for table border collision
         cushion_dampening = 0.8  # Energy loss on cushion hit
@@ -47,6 +52,11 @@ class Ball:
             self.y = HEIGHT - 80 - self.radius
             self.vy = -self.vy * cushion_dampening
             play_sound("cushion")
+
+        if abs(self.vx) < 0.12:
+            self.vx = 0
+        if abs(self.vy) < 0.12:
+            self.vy = 0
    
     def draw(self, screen):
         # Ball base
@@ -82,11 +92,20 @@ class Ball:
    
     def in_hole(self):
         for hx, hy in holes:
-            if math.hypot(self.x - hx, self.y - hy) < HOLE_RADIUS:
+            if math.hypot(self.x - hx, self.y - hy) < self.pocket_capture_radius():
                 play_sound("ball_potted")
                 self.potted = True
                 return True
         return False
+
+    def pocket_capture_radius(self):
+        return HOLE_RADIUS + self.radius * 0.65
+
+    def near_hole(self):
+        return any(
+            math.hypot(self.x - hx, self.y - hy) < self.pocket_capture_radius()
+            for hx, hy in holes
+        )
    
     def reset(self):
         self.x, self.y = self.original_pos

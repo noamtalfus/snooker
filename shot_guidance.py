@@ -62,14 +62,15 @@ def _point_segment_distance(px, py, ax, ay, bx, by):
     return math.hypot(px - cx, py - cy)
 
 
-def _path_clear(start, end, balls, ignore_numbers):
+def _path_clear(start, end, balls, ignore_numbers, ball_radius):
     ax, ay = start
     bx, by = end
     for ball in balls:
         if ball.get("potted", False) or ball.get("number", 0) in ignore_numbers:
             continue
         distance = _point_segment_distance(ball["x"], ball["y"], ax, ay, bx, by)
-        if distance < BALL_RADIUS * 2.1:
+        obstacle_radius = float(ball.get("radius", ball_radius))
+        if distance < ball_radius + obstacle_radius + 2.0:
             return False
     return True
 
@@ -82,7 +83,7 @@ def _cue_ball(obs):
     return balls[0] if balls else {"x": 300, "y": 400}
 
 
-def guided_shot_from_observation(obs, width=1200, height=800, holes=None, jitter=0.0):
+def guided_shot_from_observation(obs, width=1200, height=800, holes=None, jitter=0.0, ball_radius=None):
     """Pick a reasonable pool shot from observation geometry.
 
     The guide prefers clear direct pots. If no pot is visible, it falls back to
@@ -90,6 +91,7 @@ def guided_shot_from_observation(obs, width=1200, height=800, holes=None, jitter
     """
     holes = holes or DEFAULT_HOLES
     cue = _cue_ball(obs)
+    ball_radius = float(ball_radius if ball_radius is not None else cue.get("radius", BALL_RADIUS))
     balls = [ball for ball in obs.get("balls", []) if ball.get("number", 0) != 0]
     targets = _target_balls(obs)
     if not targets:
@@ -112,16 +114,16 @@ def guided_shot_from_observation(obs, width=1200, height=800, holes=None, jitter
             ux = to_hole_x / target_to_hole
             uy = to_hole_y / target_to_hole
             ghost = (
-                target["x"] - ux * BALL_RADIUS * 2.0,
-                target["y"] - uy * BALL_RADIUS * 2.0,
+                target["x"] - ux * ball_radius * 2.0,
+                target["y"] - uy * ball_radius * 2.0,
             )
             cue_to_ghost = math.hypot(ghost[0] - cue["x"], ghost[1] - cue["y"])
-            if cue_to_ghost <= BALL_RADIUS:
+            if cue_to_ghost <= ball_radius:
                 continue
 
-            if not _path_clear(cue_pos, ghost, balls, {target.get("number", 0)}):
+            if not _path_clear(cue_pos, ghost, balls, {target.get("number", 0)}, ball_radius):
                 continue
-            if not _path_clear(target_pos, hole, balls, {target.get("number", 0)}):
+            if not _path_clear(target_pos, hole, balls, {target.get("number", 0)}, ball_radius):
                 continue
 
             shot_angle = math.atan2(ghost[1] - cue["y"], ghost[0] - cue["x"])
@@ -147,8 +149,11 @@ def guided_shot_from_observation(obs, width=1200, height=800, holes=None, jitter
     return {"angle": angle % (2 * math.pi), "power": max(0.0, min(25.0, power))}
 
 
-def action_has_target_contact(obs, action, max_contact_distance=BALL_RADIUS * 2.4):
+def action_has_target_contact(obs, action, max_contact_distance=None):
     cue = _cue_ball(obs)
+    ball_radius = float(cue.get("radius", BALL_RADIUS))
+    if max_contact_distance is None:
+        max_contact_distance = ball_radius * 2.05
     angle = float(action.get("angle", 0.0))
     ux = math.cos(angle)
     uy = math.sin(angle)
