@@ -83,7 +83,7 @@ BLACK = (0, 0, 0)
 class PoolEnvironment:
     """Pool game environment for reinforcement learning."""
     
-    def __init__(self, render_mode=None, ball_count: int = 15, random_balls: bool = False, layout: str = "rack"):
+    def __init__(self, render_mode=None, ball_count: int = 15, random_balls: bool = False, layout: str = "rack", drill_target_pots=None):
         """Initialize the pool environment.
         
         Args:
@@ -112,6 +112,7 @@ class PoolEnvironment:
         self.shots_taken = 0
         self.random_balls = bool(random_balls)
         self.layout = self._normalize_layout(layout)
+        self.drill_target_pots = self._normalize_drill_target_pots(drill_target_pots)
         self.max_shots = self._shot_limit()
         self.players = [
             {"name": "Player 1", "type": None, "score": 0, "color": (200, 30, 30)},
@@ -139,7 +140,27 @@ class PoolEnvironment:
 
     def set_ball_count(self, count: int):
         self.ball_count = self._clamp_ball_count(count)
+        self.drill_target_pots = self._normalize_drill_target_pots(self.drill_target_pots)
         self.max_shots = self._shot_limit()
+
+    def set_drill_target_pots(self, target):
+        self.drill_target_pots = self._normalize_drill_target_pots(target)
+
+    def _normalize_drill_target_pots(self, target):
+        if target is None:
+            return None
+        try:
+            target = int(target)
+        except (TypeError, ValueError):
+            return None
+        return max(1, min(max(1, self.ball_count - 1), target))
+
+    def _default_drill_target_pots(self):
+        if self.layout == "beginner":
+            return 1 if self.ball_count <= 4 else min(2, self.ball_count - 1)
+        if self.layout == "rack" and self.ball_count <= 6:
+            return 1 if self.ball_count <= 4 else 2
+        return None
 
     def _shot_limit(self):
         if self.layout == "beginner":
@@ -728,20 +749,18 @@ class PoolEnvironment:
                 else:
                     reward -= 1.0
 
-        if self.layout == "beginner" or (self.layout == "rack" and self.ball_count <= 6):
+        required_object_pots = self.drill_target_pots
+        if required_object_pots is None:
+            required_object_pots = self._default_drill_target_pots()
+
+        if required_object_pots is not None:
             object_ball_potted = any(ball.number != 8 for ball in shot_potted_balls)
             potted_object_balls = sum(
                 1 for ball in self.balls if ball.number != 8 and ball.potted
             )
-            if self.ball_count <= 4:
-                required_object_pots = 1
-            elif self.ball_count <= 6:
-                required_object_pots = 2
-            else:
-                required_object_pots = min(3, self.ball_count - 1)
             if (
-                (self.ball_count <= 4 and object_ball_potted)
-                or (self.ball_count > 4 and potted_object_balls >= required_object_pots)
+                (required_object_pots <= 1 and object_ball_potted)
+                or potted_object_balls >= required_object_pots
             ):
                 self.winner = acting_player
                 done = True

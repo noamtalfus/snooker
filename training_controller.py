@@ -163,6 +163,7 @@ class TrainingController:
                     "target_random_balls": self.target_random_balls,
                     "target_layout": self.target_layout,
                     "target_opponent_type": self.target_opponent_type,
+                    "drill_target_pots": self.drill_target_pots,
                     "state_object_balls": self.state_object_balls,
                     "opponent_type": self.opponent_type,
                 },
@@ -205,27 +206,62 @@ class TrainingController:
         guide_end=0.0,
         advance_floor=0.0,
         regression_floor=0.0,
+        drill_target_pots=None,
     ):
+        ball_count = max(2, min(15, int(ball_count)))
+        layout = self._normalize_layout(layout)
+        drill_target_pots = self._stage_drill_target_pots(ball_count, layout, opponent_type, drill_target_pots)
+        if mastery_pots is None and drill_target_pots is not None:
+            mastery_pots = float(drill_target_pots)
+        elif mastery_pots is not None and drill_target_pots is not None:
+            mastery_pots = max(float(mastery_pots), float(drill_target_pots))
+
         return {
             "name": name,
             "start_ep": 0,
-            "ball_count": max(2, min(15, int(ball_count))),
+            "ball_count": ball_count,
             "random_balls": bool(random_balls),
-            "layout": self._normalize_layout(layout),
+            "layout": layout,
             "opponent_type": opponent_type,
             "min_episodes": int(min_episodes),
             "max_episodes": int(max_episodes),
             "mastery_win_rate": float(mastery_win_rate),
             "mastery_pots": None if mastery_pots is None else float(mastery_pots),
+            "drill_target_pots": drill_target_pots,
             "guide_start": float(guide_start),
             "guide_end": float(guide_end),
             "advance_floor": float(advance_floor),
             "regression_floor": float(regression_floor),
         }
 
+    def _stage_drill_target_pots(self, ball_count, layout, opponent_type, explicit_target=None):
+        if explicit_target is not None:
+            return max(1, min(ball_count - 1, int(explicit_target)))
+
+        if layout == "beginner":
+            return 1 if ball_count <= 4 else min(2, ball_count - 1)
+
+        if layout != "rack":
+            return None
+
+        if ball_count <= 4:
+            return 1
+        if ball_count <= 7:
+            return 2
+        if ball_count <= 10:
+            return 3
+        if ball_count <= 13:
+            return 4
+        return 5
+
     def _target_stage(self, name, start_ep):
         beginner_guidance = self.target_layout == "beginner"
-        small_rack_guidance = self.target_layout == "rack" and self.target_ball_count <= 6
+        small_rack_guidance = self.target_layout == "rack" and self.target_ball_count <= 10
+        drill_target_pots = self._stage_drill_target_pots(
+            self.target_ball_count,
+            self.target_layout,
+            self.target_opponent_type,
+        )
         return {
             "name": name,
             "start_ep": int(start_ep),
@@ -236,7 +272,8 @@ class TrainingController:
             "min_episodes": max(1, self.total_episodes),
             "max_episodes": max(1, self.total_episodes),
             "mastery_win_rate": 1.0,
-            "mastery_pots": None,
+            "mastery_pots": None if drill_target_pots is None else float(drill_target_pots),
+            "drill_target_pots": drill_target_pots,
             "guide_start": 1.0 if beginner_guidance else (0.65 if small_rack_guidance else 0.0),
             "guide_end": 1.0 if beginner_guidance else (0.15 if small_rack_guidance else 0.0),
             "advance_floor": 0.0,
@@ -364,6 +401,7 @@ class TrainingController:
         self.random_balls = bool(stage["random_balls"])
         self.layout = self._normalize_layout(stage["layout"])
         self.opponent_type = stage["opponent_type"]
+        self.drill_target_pots = stage.get("drill_target_pots")
         self._configure_learning_for_stage()
 
         if create_env:
@@ -372,6 +410,7 @@ class TrainingController:
                 ball_count=self.max_ball_count,
                 random_balls=self.random_balls,
                 layout=self.layout,
+                drill_target_pots=self.drill_target_pots,
             )
             return
 
@@ -382,6 +421,7 @@ class TrainingController:
             ball_count=self.max_ball_count,
             random_balls=self.random_balls,
             layout=self.layout,
+            drill_target_pots=self.drill_target_pots,
         )
         self.obs = self.env.reset()
         self.ep_reward = 0.0
@@ -483,6 +523,7 @@ class TrainingController:
             "opponent_type": self.target_opponent_type,
             "workout_plan": self.workout_plan,
             "curriculum_stage": self.curriculum_stage,
+            "drill_target_pots": self.drill_target_pots,
             "state_object_balls": self.state_object_balls,
         }
 
@@ -771,6 +812,7 @@ class TrainingController:
                 "random_balls": int(self.random_balls),
                 "layout": self.layout,
                 "opponent_type": self.opponent_type,
+                "drill_target_pots": self.drill_target_pots or 0,
                 "workout_plan": int(self.workout_plan),
                 "curriculum_stage": self.curriculum_stage + 1,
                 "guided_action_count": self.guided_warmup_used,
@@ -814,7 +856,8 @@ class TrainingController:
             render_mode=None,
             ball_count=self.max_ball_count,
             random_balls=self.random_balls,
-            layout=self.layout
+            layout=self.layout,
+            drill_target_pots=self.drill_target_pots,
         )
         wins = 0
         max_turns = max(20, int(eval_env.max_shots) + 10)
@@ -976,7 +1019,7 @@ class TrainingController:
             f"Policy Eval: {self.stage_eval_win_rate:.2f} | Stage Best: {self.stage_best_eval_win_rate:.2f} | Guidance: {guidance}",
             plan_line,
             stage_line,
-            f"Balls: {self.max_ball_count} | Layout: {self.layout.title()} | Random Positions: {'On' if self.random_balls else 'Off'}",
+            f"Balls: {self.max_ball_count} | Layout: {self.layout.title()} | Random Positions: {'On' if self.random_balls else 'Off'} | Drill Target: {self.drill_target_pots or 'Full game'}",
             f"Opponent: {self.opponent_type}",
             f"Checkpoint: {self.checkpoint_path}",
             "Controls: SPACE pause/resume | ESC back to menu"
